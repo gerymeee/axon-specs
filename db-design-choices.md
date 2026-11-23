@@ -299,6 +299,20 @@ what the denormalizations below address.
 New migrations reach the server before every client has upgraded, so all changes are
 **additive, idempotent, and gated**.
 
+### SQL file versions
+
+| Artifact in `db-schema/` | Version sequence | Purpose |
+|---|---|---|
+| Initial MVP baseline | [`v1.0.0.sql`](db-schema/v1.0.0.sql) | Install Axon's initial schema on Supabase. |
+| Forward migration | `v1.0.1.sql`, `v1.0.2.sql`, and so on | A developer or AI agent bumps the patch component when adding or altering tables. Apply the migrations in order and keep applied files immutable. |
+| Full schema snapshot | `v1.1.0.sql`, `v1.2.0.sql`, and so on | A developer exports the deployed schema from Supabase, bumps the minor component, and resets the patch to zero. Record the last applied migration included in the snapshot. |
+
+Continue the patch sequence under the latest snapshot version, for example with
+`v1.1.1.sql` after `v1.1.0.sql`. To upgrade an existing database, apply its outstanding
+forward migrations. For a fresh database, use the selected baseline or full snapshot and then
+apply the migrations after that baseline. Export the schema without rows, Auth data, or secrets.
+These file versions track database changes independently of the repository's release tags.
+
 ### Adding a column (server forward migration)
 
 ```sql
@@ -346,3 +360,37 @@ CREATE INDEX IF NOT EXISTS idx_note_workspace ON note (workspace_uuid);
   **fresh installs and upgrades alike**, and test the upgrade path with real data.
 - **When a new change column is added, backfill it from `created_at`,** so existing rows read as
   clean instead of being pushed all over again.
+
+## 10. Axon MVP on Supabase
+
+The [accepted business logic](business-logic-v1.1.md) requires the server to accept a waiting
+pin before it becomes visible. The offline-first patterns in sections 1–8 apply to data that
+can safely synchronize. Axon can cache eligible routes and keep a retry UUID locally. Waiting
+pins, pickup prompts, account access, and moderation are online, server-authoritative operations.
+Do not enqueue or replay stale location data through last-write-wins sync.
+
+- **Identity.** Every Axon table has a server-local identity `id` for its primary-key index and a
+  unique domain `uuid`. Relationship columns such as `route_uuid` and `passenger_uuid` point
+  to domain UUIDs. Axon accepts these writes online in dependency order, so Postgres can enforce
+  the UUID references. `auth_user_uuid` points to the Supabase-managed UUID `auth.users.id`.
+  Clients that cache records store UUID relationships, and the RPC payloads omit numeric IDs.
+- **Authorization.** Configure Google Sign-In in Supabase Auth. The API validates the access
+  token and derives the account through `axon_register`. It then supplies the account UUID to the
+  service-only RPCs and keeps the service credential on the backend. Assign initial staff roles
+  through privileged SQL after registering those accounts. The Android app and admin web panel
+  call the API with user sessions. The API keeps the active route per session and supplies it to
+  map, pickup, and report calls. The database rechecks the driver's route eligibility.
+  At sign-in, compare the saved primary route from `axon_register` with the eligible list from
+  `axon_routes` for the selected role.
+- **Waiting and location.** Use the server expiry and prompt expiry in client responses. The map
+  hides expired or out-of-scope pins immediately and projects no passenger identity. Prompt IDs
+  distinguish a late response from a response to a new prompt. Ending a request clears its
+  coordinates in the same transaction. The proximity check reads driver coordinates from the
+  request without persisting them. Set the pilot distance tolerance and prompt duration in
+  trusted API configuration and avoid recording coordinate-bearing payloads in logs.
+- **Before the pilot.** Schedule `SELECT public.axon_expire_waiting();` in Supabase Cron or
+  equivalent server scheduling so expired coordinates are cleared even without active users.
+  Choose and test the cadence against the approved location retention policy. Confirm the
+  retention of coordinate-free history, backups, and moderation records, along with the minimum
+  group size for sharing aggregate results. Review the migration and role grants in a staging
+  Supabase database before applying it to a live project.
